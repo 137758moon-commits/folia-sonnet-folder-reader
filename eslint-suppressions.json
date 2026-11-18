@@ -8977,9 +8977,6 @@
     }
   },
   "src/services/db.ts": {
-    "@stylistic/indent": {
-      "count": 165
-    },
     "@typescript-eslint/no-dynamic-delete": {
       "count": 1
     },
