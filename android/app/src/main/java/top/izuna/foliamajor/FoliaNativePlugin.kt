@@ -482,6 +482,7 @@ class FoliaNativePlugin : Plugin() {
     }
 
     /** 文件/文件夹选择器只用一份：连点两次会开两个系统界面，回来的回调就串了。 */
+    @Volatile
     private var isAudioPickerOpen = false
     private var localAudioServer: LocalAudioServer? = null
 
@@ -1871,54 +1872,28 @@ class FoliaNativePlugin : Plugin() {
 
     @ActivityCallback
     private fun handlePickedAudioFolder(call: PluginCall?, activityResult: ActivityResult?) {
-        isAudioPickerOpen = false
-        if (call == null) return
-        val resultCode = if (activityResult == null) Activity.RESULT_CANCELED else activityResult.resultCode
-        val uris = ArrayList<Uri>()
-        val data = if (activityResult == null) null else activityResult.data
-        if (data != null) {
-            val treeUri = data.data
-            if (treeUri != null) {
-                try {
-                    // 拿到长期授权：重启之后还能读这个目录，重新导入时不必再让用户选一次。
-                    getContext().contentResolver.takePersistableUriPermission(
-                        treeUri,
-                        data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                } catch (ignored: Exception) {
-                    // Some providers do not offer persistable grants; the current grant is still usable.
-                }
-                collectAudioDocuments(treeUri, DocumentsContract.getTreeDocumentId(treeUri), uris)
-            }
+        if (call == null) { isAudioPickerOpen = false; return }
+        val data = activityResult?.data
+        val tree = data?.data
+        if (activityResult?.resultCode != Activity.RESULT_OK || tree == null) {
+            isAudioPickerOpen = false
+            completePickedAudioImport(call, emptyList(), activityResult?.resultCode ?: Activity.RESULT_CANCELED)
+            return
         }
-        completePickedAudioImport(call, uris, resultCode)
-    }
-
-    private fun collectAudioDocuments(treeUri: Uri, parentDocumentId: String, output: MutableList<Uri>) {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE
-        )
-        try {
-            getContext().contentResolver.query(childrenUri, projection, null, null, null).use { cursor ->
-                if (cursor == null) return
-                while (cursor.moveToNext()) {
-                    val documentId = cursor.getString(0)
-                    val displayName = cursor.getString(1)
-                    val mimeType = cursor.getString(2)
-                    if (DocumentsContract.Document.MIME_TYPE_DIR == mimeType) {
-                        collectAudioDocuments(treeUri, documentId, output)
-                        continue
-                    }
-                    if (isAudioDocument(displayName, mimeType)) {
-                        output.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId))
-                    }
-                }
+        // Keep the grant across process/device restarts before publishing any references.
+        BackgroundWork.bulk("audio-folder-reference") {
+            try {
+                getContext().contentResolver.takePersistableUriPermission(
+                    tree, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+                if (localAudioServer == null) localAudioServer = LocalAudioServer(getContext())
+                val result = DocumentAudioLibrary.importFolder(getContext(), tree, localAudioServer!!.start())
+                call.resolve(result)
+            } catch (error: Exception) {
+                call.reject("Cannot read selected music folder: " + error.message, error)
+            } finally {
+                isAudioPickerOpen = false
             }
-        } catch (ignored: Exception) {
-            // A provider can deny one subtree without invalidating the rest of the selection.
         }
     }
 
@@ -2406,6 +2381,13 @@ class FoliaNativePlugin : Plugin() {
         val ref = call.getString("ref")
         if (ref == null || ref.isEmpty()) {
             call.reject("Missing audio ref")
+            return
+        }
+        if (ref.startsWith(DocumentAudioLibrary.REF_PREFIX)) {
+            call.resolve(JSObject().apply {
+                put("copied", false)
+                put("error", "Folder access expired or source unavailable; select the folder again")
+            })
             return
         }
         val fileName = call.getString("fileName")

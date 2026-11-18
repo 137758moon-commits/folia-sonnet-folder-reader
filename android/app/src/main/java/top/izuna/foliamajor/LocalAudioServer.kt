@@ -12,6 +12,7 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -34,9 +35,10 @@ import okhttp3.ResponseBody
 /**
  * 本地音频流服务器。
  *
- * 三种来源：
+ * 来源：
  *   /audio/<MediaStore id>          系统媒体库里的文件
  *   /audio/imported-<file name>     通过系统文件管理器挑选后复制进 App 私有目录的文件
+ *   /audio/document-<id>           通过持久目录授权直接读取的原始音频
  *   /video-layer/<anything>         歌词后方视频层那一个视频（VideoLayerFile 的私有副本）
  *
  * WebView 的 <audio> / <video> 播不了 content:// 这种 URI，也不认 App 私有目录里的路径，
@@ -646,6 +648,10 @@ class LocalAudioServer(context: Context) {
                         }
 
                         val token = URLDecoder.decode(path.substring(AUDIO_PATH_PREFIX.length), "UTF-8")
+                        if (token.startsWith(DocumentAudioLibrary.REF_PREFIX)) {
+                            streamDocumentFile(output, requestParts, headers, token)
+                            return
+                        }
                         /*
                          * 新格式（导入副本）：token 是 `local-<id>`，如 `local-3`。
                          *
@@ -683,6 +689,98 @@ class LocalAudioServer(context: Context) {
             // 之前这里连日志都没有：流写到一半断掉，WebView 那边只会报一句
             // Format error，原生侧连发生了什么都不知道。
             Log.w(TAG, "audio request failed", error)
+        }
+    }
+
+    @Throws(IOException::class)
+    private fun streamDocumentFile(
+        output: BufferedOutputStream,
+        requestParts: Array<String>,
+        headers: Map<String, String>,
+        reference: String
+    ) {
+        val uri = DocumentAudioLibrary.resolve(context, reference)
+        if (uri == null) {
+            writeStatus(output, 404, "Not Found")
+            return
+        }
+        val resolver = context.contentResolver
+        val descriptor = try {
+            resolver.openAssetFileDescriptor(uri, "r")
+        } catch (_: SecurityException) {
+            writeStatus(output, 403, "Folder Permission Required")
+            return
+        } catch (_: IOException) {
+            writeStatus(output, 404, "Not Found")
+            return
+        }
+        if (descriptor == null) {
+            writeStatus(output, 404, "Not Found")
+            return
+        }
+        descriptor.use { asset ->
+            var size = asset.length
+            var name = ""
+            var modified = 0L
+            resolver.query(uri, arrayOf(
+                android.provider.OpenableColumns.DISPLAY_NAME,
+                android.provider.OpenableColumns.SIZE,
+                android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            ), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    name = cursor.getString(0).orEmpty()
+                    if (size < 0 && !cursor.isNull(1) && cursor.getLong(1) > 0) size = cursor.getLong(1)
+                    if (!cursor.isNull(2)) modified = cursor.getLong(2)
+                }
+            }
+            val mime = guessMimeType(name)
+            if (size < 0) size = DocumentAudioLibrary.cachedSize(context, reference, modified) ?: -1L
+            if (size < 0) {
+                // A changed pipe document must be measured once; future probes/seeks reuse the metadata.
+                size = asset.createInputStream().use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    var count: Int
+                    while (input.read(buffer).also { count = it } != -1) total += count
+                    total
+                }
+                DocumentAudioLibrary.rememberSize(context, reference, size, modified)
+                val reopened = resolver.openAssetFileDescriptor(uri, "r")
+                if (reopened == null) {
+                    writeStatus(output, 404, "Not Found")
+                    return
+                }
+                reopened.use { source ->
+                    writeResponse(output, requestParts, headers, size, mime, StreamSupplier { documentInputStream(source.createInputStream()) })
+                }
+                return
+            }
+            writeResponse(output, requestParts, headers, size, mime, StreamSupplier { documentInputStream(asset.createInputStream()) })
+        }
+    }
+
+    // File descriptors can seek; provider pipes must discard bytes with a bounded buffer instead.
+    private fun documentInputStream(input: InputStream): InputStream = object : FilterInputStream(input) {
+        private var canSeek = true
+
+        override fun skip(bytes: Long): Long {
+            if (bytes <= 0) return 0
+            if (canSeek) {
+                try {
+                    val skipped = super.skip(bytes)
+                    if (skipped > 0) return skipped
+                } catch (_: IOException) {
+                    canSeek = false
+                }
+            }
+            val buffer = ByteArray(64 * 1024)
+            var remaining = bytes
+            while (remaining > 0) {
+                val count = read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                if (count < 0) break
+                remaining -= count
+            }
+            return bytes - remaining
         }
     }
 

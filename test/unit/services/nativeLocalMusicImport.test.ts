@@ -1,18 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LocalSong } from '@/types';
-import { importExternalAudioTracks } from '@/services/nativeLocalMusic';
+import { copyAndroidLocalAudio, deleteAndroidImportedAudio, importExternalAudioTracks } from '@/services/nativeLocalMusic';
 
 // test/unit/services/nativeLocalMusicImport.test.ts
 // 「用 Folia 打开」第二次打开同一个文件时，曲库里已经有这首歌了 —— 那时新增的是 0 首，
 // 但「加到歌单」这件事还得照做。以前这一步只返回「新写进去的」，0 首就意味着歌单一首
 // 都没加，表现是「提示说已经在库里了，歌单里却一首都没有」。这里钉住 fresh / resolved 的语义。
 
-const state = vi.hoisted(() => ({ songs: [] as LocalSong[] }));
+const state = vi.hoisted(() => ({
+    songs: [] as LocalSong[],
+    copyLocalAudio: vi.fn(async () => ({ copied: true, ref: 'local-copy' })),
+    deleteImportedAudio: vi.fn(async () => ({ deleted: [], failed: [] })),
+}));
+
+vi.mock('@capacitor/core', () => ({
+    Capacitor: {
+        getPlatform: () => 'android',
+        isNativePlatform: () => true,
+        isPluginAvailable: () => true,
+    },
+    registerPlugin: () => ({
+        copyLocalAudio: state.copyLocalAudio,
+        deleteImportedAudio: state.deleteImportedAudio,
+    }),
+}));
 
 vi.mock('@/services/db', () => ({
     getLocalSongs: vi.fn(async () => state.songs.slice()),
     saveLocalSongs: vi.fn(async (songs: LocalSong[]) => {
-        state.songs.push(...songs);
+        songs.forEach(song => {
+            const index = state.songs.findIndex(existing => existing.id === song.id);
+            if (index === -1) state.songs.push(song);
+            else state.songs[index] = song;
+        });
     }),
 }));
 
@@ -58,6 +78,8 @@ const track = (id: string, fileName: string, fileSize?: number) => ({
 describe('importExternalAudioTracks', () => {
     beforeEach(() => {
         state.songs = [];
+        state.copyLocalAudio.mockClear();
+        state.deleteImportedAudio.mockClear();
         vi.stubGlobal('fetch', vi.fn(async () => ({
             blob: async () => new Blob([new Uint8Array(16)]),
         })));
@@ -70,6 +92,42 @@ describe('importExternalAudioTracks', () => {
         expect(result.resolved).toHaveLength(1);
         expect(result.fresh[0].id).toBe(result.resolved[0].id);
         expect(result.fresh[0].nativeAudioRef).toBe('imported-a');
+    });
+
+    it('persists document references without merging distinct folders into an old private copy', async () => {
+        state.songs = [existingSong({ nativeAudioRef: 'local-1' })];
+        const inputs = [track('document-a', 'song.mp3', 1234), track('document-b', 'song.mp3', 1234)];
+        const first = await importExternalAudioTracks(inputs);
+        expect(first.fresh.map(song => song.nativeAudioRef)).toEqual(['document-a', 'document-b']);
+        const again = await importExternalAudioTracks(inputs);
+        expect(again.fresh).toHaveLength(0);
+        expect(again.resolved.map(song => song.id)).toEqual(first.resolved.map(song => song.id));
+    });
+
+    it('never materializes or deletes a referenced folder document', async () => {
+        expect(await copyAndroidLocalAudio('document-a', 'song.flac', 1234)).toBeNull();
+        expect(await deleteAndroidImportedAudio(['document-a'])).toEqual({ deleted: [], failed: [] });
+        expect(state.copyLocalAudio).not.toHaveBeenCalled();
+        expect(state.deleteImportedAudio).not.toHaveBeenCalled();
+    });
+
+    it('reuses the actual scanned file identity and retains its playlist id and manual lyrics', async () => {
+        const original = existingSong({
+            id: 'android-media-41', nativeAudioRef: '41',
+            title: 'My edited title', hasManualLyricSelection: true,
+        });
+        state.songs = [original];
+        const result = await importExternalAudioTracks([
+            { ...track('document-a', 'song.mp3', 1234), sourceRefs: ['file-/storage/emulated/0/Music/song.mp3', '41'] },
+            { ...track('document-b', 'song.mp3', 1234), sourceRefs: ['42'] },
+        ]);
+        expect(result.fresh.map(song => song.nativeAudioRef)).toEqual(['document-b']);
+        expect(result.resolved[0]).toMatchObject({
+            id: 'android-media-41', nativeAudioRef: 'document-a',
+            title: 'My edited title', hasManualLyricSelection: true,
+        });
+        expect(state.songs).toHaveLength(2);
+        expect(state.songs.find(song => song.id === original.id)?.nativeAudioRef).toBe('document-a');
     });
 
     it('still resolves the record already sitting in the library, so the playlist gets it', async () => {

@@ -51,7 +51,7 @@ android {
         version = release(37)
     }
     defaultConfig {
-        applicationId "top.izuna.foliamajor"
+        applicationId "top.izuna.foliamajor.folderreader"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         // 测试版（`0.7.25.dev2` 这种）的 code 由 package.json 的 androidVersionCode 显式给出：
@@ -229,6 +229,7 @@ dependencies {
     // 给测试类路径放一份真实实现即可，不进包。
     testImplementation "org.json:json:20240303"
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.robolectric:robolectric:4.18"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
@@ -255,6 +256,20 @@ apply from: 'capacitor.build.gradle'
 android {
     // 新增的跨端回归测试统一留在仓库 test/unit，Gradle 仍直接执行真实 Kotlin 实现。
     sourceSets.test.java.srcDir '../../test/unit/android'
+    testOptions {
+        unitTests.all {
+            // Robolectric's document provider tests run on the same JDK 21 used for Android builds.
+            jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.base/java.io=ALL-UNNAMED',
+                '--add-opens=java.base/java.net=ALL-UNNAMED',
+                '--add-opens=java.base/java.security=ALL-UNNAMED',
+                '--add-opens=java.base/java.text=ALL-UNNAMED',
+                '--add-opens=java.base/jdk.internal.access=ALL-UNNAMED',
+                '--add-opens=java.desktop/java.awt.font=ALL-UNNAMED',
+                '--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED'
+        }
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

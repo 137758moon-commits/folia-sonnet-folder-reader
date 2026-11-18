@@ -13,6 +13,15 @@ const track = (id: string, fileName: string, fileSize?: number) => ({
 });
 
 describe('dedupePickedTracks', () => {
+    it('keeps distinct folder documents even when names and sizes match', () => {
+        const kept = dedupePickedTracks([
+            track('document-a', 'song.flac', 1234),
+            track('document-b', 'song.flac', 1234),
+            track('document-a', 'song.flac', 1234),
+        ]);
+        expect(kept.map(entry => entry.id)).toEqual(['document-a', 'document-b']);
+    });
+
     it('collapses the same file handed over twice with the same ref', () => {
         const kept = dedupePickedTracks([
             track('imported-a', 'song.mp3', 1234),

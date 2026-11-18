@@ -17,7 +17,7 @@ import { noteLibraryStep } from '../nativeBridge/api/libraryTrace.js';
  * 直接被判成不可用，表现为「本地打不开」。这里改走原生：
  *
  * · 扫描设备音乐库（MediaStore）：读系统已经收录的音频，不用用户自己去翻文件管理器。
- * · 挑选文件 / 整个文件夹（Storage Access Framework）：挑中的由原生复制进 App 私有目录。
+ * · 挑选文件夹（Storage Access Framework）：持久授权后直接读取原文件；单文件导入使用私有副本。
  *
  * 两种来源的音频都不能直接给 WebView：`content://` 播不了，私有目录它也不认。
  * 所以原生另起了一个只监听 127.0.0.1 的小服务（LocalAudioServer）把音频以 http 喂回来，
@@ -27,6 +27,7 @@ import { noteLibraryStep } from '../nativeBridge/api/libraryTrace.js';
 
 type NativeAudioTrack = {
     id: string;
+    sourceRefs?: string[];
     fileName: string;
     title?: string;
     artist?: string;
@@ -152,7 +153,7 @@ export const copyAndroidLocalAudio = async (
     fileSize?: number,
 ): Promise<string | null> => {
     const plugin = getPlugin();
-    if (!ref || !plugin?.copyLocalAudio) return null;
+    if (!ref || ref.startsWith('document-') || !plugin?.copyLocalAudio) return null;
     try {
         const response = await plugin.copyLocalAudio({
             ref,
@@ -340,7 +341,7 @@ export const dedupePickedTracks = (tracks: NativeAudioTrack[]): NativeAudioTrack
             if (seenRefs.has(ref)) return false;
             seenRefs.add(ref);
         }
-        const contentKey = pickedContentKey(track.fileName, track.fileSize);
+        const contentKey = ref.startsWith('document-') ? null : pickedContentKey(track.fileName, track.fileSize);
         if (contentKey) {
             if (seenContent.has(contentKey)) return false;
             seenContent.add(contentKey);
@@ -355,7 +356,7 @@ export const dedupePickedTracks = (tracks: NativeAudioTrack[]): NativeAudioTrack
  * 优先挑整个文件夹（用户一次选一张专辑 / 一个目录），原生侧递归扫出里面的音频；
  * 旧设备上没有这个方法时退回逐个挑文件。
  *
- * 选中的文件由原生侧复制进 App 私有目录，之后通过本机回环地址流式播放，
+ * 文件夹中的音频通过持久文档引用与本机回环地址流式播放，
  * 所以不依赖 MediaStore 是否收录过这些文件，也不需要整盘存储权限。
  */
 export type ImportedTracksResult = {
@@ -380,6 +381,7 @@ export type ImportedTracksResult = {
 const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<ImportedTracksResult> => {
     const now = Date.now();
     const songs: LocalSong[] = [];
+    const sourceRefs = new Map(tracks.map(track => [track.id, track.sourceRefs]));
 
     for (const track of tracks) {
         const fileName = track.fileName || `track-${track.id}`;
@@ -456,20 +458,31 @@ const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<
         if (song.nativeAudioRef && !existingByRef.has(song.nativeAudioRef)) {
             existingByRef.set(song.nativeAudioRef, song);
         }
-        const contentKey = pickedContentKey(song.fileName, song.fileSize);
+        const contentKey = song.nativeAudioRef?.startsWith('document-') ? null : pickedContentKey(song.fileName, song.fileSize);
         if (contentKey && !existingByContent.has(contentKey)) {
             existingByContent.set(contentKey, song);
         }
     });
 
     const freshSongs: LocalSong[] = [];
+    const updatedSongs: LocalSong[] = [];
     const resolvedSongs: LocalSong[] = [];
     songs.forEach(song => {
-        const contentKey = pickedContentKey(song.fileName, song.fileSize);
+        const contentKey = song.nativeAudioRef?.startsWith('document-') ? null : pickedContentKey(song.fileName, song.fileSize);
+        const sourceRef = song.nativeAudioRef
+            ? sourceRefs.get(song.nativeAudioRef)?.find(ref => existingByRef.has(ref))
+            : undefined;
         const already = (song.nativeAudioRef ? existingByRef.get(song.nativeAudioRef) : undefined)
+            ?? (sourceRef ? existingByRef.get(sourceRef) : undefined)
             ?? (contentKey ? existingByContent.get(contentKey) : undefined);
         if (already) {
-            resolvedSongs.push(already);
+            // Keep playlists/user edits on the old record, but use the durable folder grant for playback.
+            const resolved = sourceRef && already.nativeAudioRef === sourceRef
+                ? { ...already, nativeAudioRef: song.nativeAudioRef }
+                : already;
+            if (resolved !== already) updatedSongs.push(resolved);
+            resolvedSongs.push(resolved);
+            if (song.nativeAudioRef) existingByRef.set(song.nativeAudioRef, resolved);
             return;
         }
         freshSongs.push(song);
@@ -483,8 +496,10 @@ const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<
         });
     }
 
+    if (freshSongs.length > 0 || updatedSongs.length > 0) {
+        await saveLocalSongs([...freshSongs, ...updatedSongs]);
+    }
     if (freshSongs.length > 0) {
-        await saveLocalSongs(freshSongs);
         noteLibraryStep('local', 'pick:saved', { songs: freshSongs.length });
         // 文件里没内嵌封面的歌（原生解析拿不到 cover 的那种）立刻去在线平台要一张，
         // 不用等播到它。扫描设备音乐与外部音频导入都走这里，所以挂在这一处就够。
