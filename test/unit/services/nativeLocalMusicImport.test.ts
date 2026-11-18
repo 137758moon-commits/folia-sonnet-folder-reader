@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LocalSong } from '@/types';
 import { copyAndroidLocalAudio, deleteAndroidImportedAudio, importExternalAudioTracks } from '@/services/nativeLocalMusic';
+import { parseDocumentMetadataAsync } from '@/utils/localMetadataWorkerClient';
+import { saveLocalSongs } from '@/services/db';
 
 // test/unit/services/nativeLocalMusicImport.test.ts
 // 「用 Folia 打开」第二次打开同一个文件时，曲库里已经有这首歌了 —— 那时新增的是 0 首，
@@ -27,6 +29,15 @@ vi.mock('@capacitor/core', () => ({
 
 vi.mock('@/services/db', () => ({
     getLocalSongs: vi.fn(async () => state.songs.slice()),
+    getLocalSong: vi.fn(async (id: string) => state.songs.find(song => song.id === id)),
+    replaceLocalAudioReference: vi.fn(async (id: string, previousRef: string, nextRef: string) => {
+        const index = state.songs.findIndex(song => song.id === id);
+        if (index < 0) return undefined;
+        const current = state.songs[index];
+        if (current.nativeAudioRef !== previousRef) return current;
+        state.songs[index] = { ...current, nativeAudioRef: nextRef };
+        return state.songs[index];
+    }),
     saveLocalSongs: vi.fn(async (songs: LocalSong[]) => {
         songs.forEach(song => {
             const index = state.songs.findIndex(existing => existing.id === song.id);
@@ -38,6 +49,7 @@ vi.mock('@/services/db', () => ({
 
 vi.mock('@/utils/localMetadataWorkerClient', () => ({
     parseEmbeddedMetadataAsync: vi.fn(async () => null),
+    parseDocumentMetadataAsync: vi.fn(async () => null),
 }));
 
 vi.mock('@/nativeBridge/api/libraryTrace.js', () => ({
@@ -80,6 +92,8 @@ describe('importExternalAudioTracks', () => {
         state.songs = [];
         state.copyLocalAudio.mockClear();
         state.deleteImportedAudio.mockClear();
+        vi.mocked(parseDocumentMetadataAsync).mockClear();
+        vi.mocked(saveLocalSongs).mockClear();
         vi.stubGlobal('fetch', vi.fn(async () => ({
             blob: async () => new Blob([new Uint8Array(16)]),
         })));
@@ -111,6 +125,32 @@ describe('importExternalAudioTracks', () => {
         expect(state.deleteImportedAudio).not.toHaveBeenCalled();
     });
 
+    it('does not fetch whole document audio, including when range metadata fails or the folder is reimported', async () => {
+        const input = track('document-a', 'song.flac', 512 * 1024 * 1024);
+        vi.mocked(parseDocumentMetadataAsync).mockResolvedValue(null);
+        await importExternalAudioTracks([input]);
+        await importExternalAudioTracks([input]);
+        expect(parseDocumentMetadataAsync).toHaveBeenCalledOnce();
+        expect(fetch).not.toHaveBeenCalled();
+        expect(state.songs).toHaveLength(1);
+    });
+
+    it('persists small batches before parsing the rest of a large document folder', async () => {
+        const inputs = Array.from({ length: 61 }, (_, i) => track(`document-${i}`, `${i}.flac`, 10_000_000));
+        let parsed = 0;
+        vi.mocked(parseDocumentMetadataAsync).mockImplementation(async () => {
+            parsed++;
+            expect(parsed - state.songs.length).toBeLessThanOrEqual(25);
+            return null;
+        });
+        const result = await importExternalAudioTracks(inputs);
+        expect(result.fresh).toHaveLength(61);
+        expect(state.songs).toHaveLength(61);
+        expect(saveLocalSongs).toHaveBeenCalledTimes(3);
+        expect(fetch).not.toHaveBeenCalled();
+        vi.mocked(parseDocumentMetadataAsync).mockResolvedValue(null);
+    });
+
     it('reuses the actual scanned file identity and retains its playlist id and manual lyrics', async () => {
         const original = existingSong({
             id: 'android-media-41', nativeAudioRef: '41',
@@ -128,6 +168,26 @@ describe('importExternalAudioTracks', () => {
         });
         expect(state.songs).toHaveLength(2);
         expect(state.songs.find(song => song.id === original.id)?.nativeAudioRef).toBe('document-a');
+    });
+
+    it('keeps edits made while earlier document metadata is still being parsed', async () => {
+        const original = existingSong({ id: 'android-media-41', nativeAudioRef: '41' });
+        state.songs = [original];
+        let resume!: () => void;
+        const paused = new Promise<null>(resolve => { resume = () => resolve(null); });
+        vi.mocked(parseDocumentMetadataAsync).mockReturnValueOnce(paused);
+        const importing = importExternalAudioTracks([
+            track('document-new', 'new.flac', 9999),
+            { ...track('document-old', 'song.mp3', 1234), sourceRefs: ['41'] },
+        ]);
+        await vi.waitFor(() => expect(parseDocumentMetadataAsync).toHaveBeenCalled());
+        state.songs[0] = { ...original, title: 'Edited during import', hasManualLyricSelection: true };
+        resume();
+        const result = await importing;
+        expect(state.songs.find(song => song.id === original.id)).toMatchObject({
+            title: 'Edited during import', hasManualLyricSelection: true, nativeAudioRef: 'document-old',
+        });
+        expect(result.resolved.find(song => song.id === original.id)?.title).toBe('Edited during import');
     });
 
     it('still resolves the record already sitting in the library, so the playlist gets it', async () => {

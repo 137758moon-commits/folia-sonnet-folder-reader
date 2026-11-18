@@ -1,3 +1,7 @@
+import type { DocumentMetadataSource } from '../services/nativeLocalMusic/rangeTokenizer';
+
+// Shares the metadata worker without transferring complete Android document audio files.
+
 export interface EmbeddedMetadataResult {
     title?: string;
     artist?: string;
@@ -71,3 +75,13 @@ export const hashLocalCoverBlobAsync = (cover: Blob): Promise<HashedLocalCoverRe
         worker.postMessage({ type: 'hash-cover', cover, requestId });
     });
 };
+
+export const parseDocumentMetadataAsync = (
+    documentSource: DocumentMetadataSource,
+    includeCover = false,
+): Promise<EmbeddedMetadataResult | null> => new Promise(resolve => {
+    const worker = initMetadataWorker();
+    const requestId = `document_meta_req_${++workerRequestId}`;
+    workerCallbacks.set(requestId, result => resolve(result as EmbeddedMetadataResult | null));
+    worker.postMessage({ type: 'parse-document-metadata', documentSource, includeCover, requestId });
+});

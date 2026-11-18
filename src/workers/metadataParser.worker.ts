@@ -1,4 +1,7 @@
 import { parseBlob } from 'music-metadata';
+import type { IAudioMetadata } from 'music-metadata';
+import { parseDocumentMetadata } from '../services/nativeLocalMusic/documentMetadata';
+import type { DocumentMetadataSource } from '../services/nativeLocalMusic/rangeTokenizer';
 import { repairFlacMetadata } from '../utils/flacMetadataRepair';
 import { hasLegacyId3Tags, repairLatin1DecodedGbkText } from '../utils/legacyTagTextRepair';
 import { formatLrcTimestamp } from '../utils/lyrics/lrcTimestamp';
@@ -149,7 +152,10 @@ function getDurationFromParsedMetadata(durationSeconds?: number): number {
 async function extractEmbeddedMetadata(file: File, includeCover = false): Promise<EmbeddedMetadataResult> {
     const parsingInput = withMetadataParserTypeHint(await repairFlacMetadata(file, includeCover), file.name);
     const parsed = await parseBlob(parsingInput, includeCover ? undefined : { skipCovers: true });
+    return summarizeEmbeddedMetadata(parsed, includeCover);
+}
 
+async function summarizeEmbeddedMetadata(parsed: IAudioMetadata, includeCover: boolean): Promise<EmbeddedMetadataResult> {
     let originalLyric: string | undefined;
     let translationLyric: string | undefined;
 
@@ -254,15 +260,16 @@ async function extractEmbeddedMetadata(file: File, includeCover = false): Promis
 }
 
 self.onmessage = async (e: MessageEvent) => {
-    const { type, file, cover, includeCover, requestId } = e.data as {
+    const { type, file, cover, documentSource, includeCover, requestId } = e.data as {
         type: string;
         file?: File;
         cover?: Blob;
+        documentSource?: DocumentMetadataSource;
         includeCover?: boolean;
         requestId: string;
     };
 
-    if (type !== 'parse-metadata' && type !== 'hash-cover') {
+    if (type !== 'parse-metadata' && type !== 'hash-cover' && type !== 'parse-document-metadata') {
         self.postMessage({ type: 'error', message: 'Unknown message type', requestId });
         return;
     }
@@ -278,6 +285,13 @@ self.onmessage = async (e: MessageEvent) => {
             return;
         }
 
+        if (type === 'parse-document-metadata') {
+            if (!documentSource) throw new Error('Missing document metadata source');
+            const parsed = await parseDocumentMetadata(documentSource, Boolean(includeCover));
+            const data = await summarizeEmbeddedMetadata(parsed, Boolean(includeCover));
+            self.postMessage({ type: 'result', data, requestId });
+            return;
+        }
         if (!(file instanceof File)) throw new Error('Missing metadata file');
         const data = await extractEmbeddedMetadata(file, Boolean(includeCover));
         self.postMessage({ type: 'result', data, requestId });

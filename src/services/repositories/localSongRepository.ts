@@ -103,6 +103,18 @@ export const readLocalSong = async (id: string): Promise<LocalSong | undefined> 
   return storedSong ? (await migrateStoredLocalSongs([storedSong]))[0] : undefined;
 };
 
+// A folder grant replaces only the audio pointer; concurrent lyric/title edits remain on the current record.
+export const replaceLocalAudioReference = async (
+    id: string,
+    previousRef: string,
+    nextRef: string,
+): Promise<LocalSong | undefined> => appDatabase.transaction('rw', appDatabase.local_music, async () => {
+    const current = await appDatabase.local_music.get(id);
+    if (!current || current.nativeAudioRef !== previousRef) return current;
+    await appDatabase.local_music.update(id, { nativeAudioRef: nextRef });
+    return { ...current, nativeAudioRef: nextRef };
+});
+
 export const removeLocalSong = async (id: string): Promise<void> => {
   await appDatabase.local_music.delete(id);
 };

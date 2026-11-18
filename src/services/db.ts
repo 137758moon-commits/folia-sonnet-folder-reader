@@ -42,6 +42,7 @@ import { clearNativeMediaCache, getNativeMediaCacheStats } from './mediaCacheSto
 
 export type { CacheData, SessionData } from './dbTypes';
 export { getCacheKeysByPrefix, removeCacheEntries, removeCacheEntriesByPrefix };
+export { replaceLocalAudioReference } from './repositories/localSongRepository';
 
 const hasElectronAudioCacheBridge = () => (
     typeof window !== 'undefined' &&

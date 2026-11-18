@@ -1,11 +1,11 @@
 import type { LocalSong } from '../types';
 import { Capacitor, registerPlugin } from '@capacitor/core';
-import { getLocalSongs, saveLocalSongs } from './db';
+import { getLocalSong, getLocalSongs, replaceLocalAudioReference, saveLocalSongs } from './db';
 import { stageLocalCoverAsset } from './localCoverAssetService';
 import { fetchOnlineCoversForImportedSongs } from './localCoverAutoFetch';
 import { clearLocalRootRemoved, isLocalRootRemoved } from './localLibraryFolderIgnore';
 import { buildImportedMetadataSnapshot } from '../utils/localSongMetadata';
-import { parseEmbeddedMetadataAsync } from '../utils/localMetadataWorkerClient';
+import { parseDocumentMetadataAsync, parseEmbeddedMetadataAsync } from '../utils/localMetadataWorkerClient';
 import { noteLibraryStep } from '../nativeBridge/api/libraryTrace.js';
 
 // src/services/nativeLocalMusic.ts
@@ -372,28 +372,49 @@ export type ImportedTracksResult = {
 };
 
 /**
- * 一批原生已经拷好的音频 → 本机曲库里的记录，并落库。
+ * 一批原生音频引用 → 本机曲库里的记录，并落库。
  *
  * 「挑文件导入」和外部打开（"用 Folia 打开" / 分享，见 takeExternalAudioTracks）共用：
  * 两条路从原生拿到的都是同一套 { id, fileName, fileSize, mimeType, url }，
  * 所以读内嵌元数据、与库里已有音频去重、写库这些后处理只写一份。
  */
-const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<ImportedTracksResult> => {
+type ImportedSongIndex = { byRef: Map<string, LocalSong>; byContent: Map<string, LocalSong> };
+
+const buildAndStoreImportedBatch = async (
+    tracks: NativeAudioTrack[],
+    index: ImportedSongIndex,
+): Promise<ImportedTracksResult> => {
     const now = Date.now();
     const songs: LocalSong[] = [];
     const sourceRefs = new Map(tracks.map(track => [track.id, track.sourceRefs]));
+    const { byRef: existingByRef, byContent: existingByContent } = index;
 
     for (const track of tracks) {
+        const document = track.id.startsWith('document-');
+        if (document) {
+            const scannedRef = track.sourceRefs?.find(ref => existingByRef.has(ref));
+            const already = existingByRef.get(track.id) ?? (scannedRef ? existingByRef.get(scannedRef) : undefined);
+            if (already) {
+                songs.push({ ...already, nativeAudioRef: track.id });
+                continue;
+            }
+        }
         const fileName = track.fileName || `track-${track.id}`;
         const fallbackTitle = titleFromFileName(fileName);
         let metadata: Awaited<ReturnType<typeof parseEmbeddedMetadataAsync>> = null;
         let metadataError: string | undefined;
         try {
-            // 回环地址是跨源的，LocalAudioServer 那边带 `Access-Control-Allow-Origin: *`。
-            const blob = await (await fetch(track.url)).blob();
-            metadata = await parseEmbeddedMetadataAsync(new File([blob], fileName, {
-                type: track.mimeType || 'audio/*',
-            }), true);
+            if (document) {
+                metadata = await parseDocumentMetadataAsync({
+                    url: track.url, fileName, fileSize: Number(track.fileSize) || 0, mimeType: track.mimeType,
+                }, true);
+            } else {
+                // 单文件/外部打开仍沿用上游；文件夹文档绝不回退成整首 Blob。
+                const blob = await (await fetch(track.url)).blob();
+                metadata = await parseEmbeddedMetadataAsync(new File([blob], fileName, {
+                    type: track.mimeType || 'audio/*',
+                }), true);
+            }
         } catch (error) {
             metadataError = error instanceof Error ? error.message : String(error);
             console.warn('[NativeLocalMusic] Failed to parse embedded metadata', fileName, error);
@@ -451,23 +472,9 @@ const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<
 
     // 第二道兜底：库里已经有了的同一份音频不再加一条（见 pickedContentKey）。
     // 查重的同时把「库里已有的那条」也记下来：不重复加，但该加的歌单还得加。
-    const existingSongs = songs.length > 0 ? await getLocalSongs() : [];
-    const existingByRef = new Map<string, LocalSong>();
-    const existingByContent = new Map<string, LocalSong>();
-    existingSongs.forEach(song => {
-        if (song.nativeAudioRef && !existingByRef.has(song.nativeAudioRef)) {
-            existingByRef.set(song.nativeAudioRef, song);
-        }
-        const contentKey = song.nativeAudioRef?.startsWith('document-') ? null : pickedContentKey(song.fileName, song.fileSize);
-        if (contentKey && !existingByContent.has(contentKey)) {
-            existingByContent.set(contentKey, song);
-        }
-    });
-
     const freshSongs: LocalSong[] = [];
-    const updatedSongs: LocalSong[] = [];
     const resolvedSongs: LocalSong[] = [];
-    songs.forEach(song => {
+    for (const song of songs) {
         const contentKey = song.nativeAudioRef?.startsWith('document-') ? null : pickedContentKey(song.fileName, song.fileSize);
         const sourceRef = song.nativeAudioRef
             ? sourceRefs.get(song.nativeAudioRef)?.find(ref => existingByRef.has(ref))
@@ -477,17 +484,19 @@ const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<
             ?? (contentKey ? existingByContent.get(contentKey) : undefined);
         if (already) {
             // Keep playlists/user edits on the old record, but use the durable folder grant for playback.
-            const resolved = sourceRef && already.nativeAudioRef === sourceRef
-                ? { ...already, nativeAudioRef: song.nativeAudioRef }
-                : already;
-            if (resolved !== already) updatedSongs.push(resolved);
+            const resolved = sourceRef && already.nativeAudioRef === sourceRef && song.nativeAudioRef
+                ? await replaceLocalAudioReference(already.id, sourceRef, song.nativeAudioRef)
+                : song.nativeAudioRef?.startsWith('document-') ? await getLocalSong(already.id) : already;
+            if (!resolved) continue;
             resolvedSongs.push(resolved);
             if (song.nativeAudioRef) existingByRef.set(song.nativeAudioRef, resolved);
-            return;
+            continue;
         }
         freshSongs.push(song);
         resolvedSongs.push(song);
-    });
+        if (song.nativeAudioRef) existingByRef.set(song.nativeAudioRef, song);
+        if (contentKey) existingByContent.set(contentKey, song);
+    }
 
     if (freshSongs.length !== songs.length) {
         noteLibraryStep('local', 'pick:already-in-library', {
@@ -496,16 +505,32 @@ const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<
         });
     }
 
-    if (freshSongs.length > 0 || updatedSongs.length > 0) {
-        await saveLocalSongs([...freshSongs, ...updatedSongs]);
-    }
     if (freshSongs.length > 0) {
+        await saveLocalSongs(freshSongs);
         noteLibraryStep('local', 'pick:saved', { songs: freshSongs.length });
-        // 文件里没内嵌封面的歌（原生解析拿不到 cover 的那种）立刻去在线平台要一张，
-        // 不用等播到它。扫描设备音乐与外部音频导入都走这里，所以挂在这一处就够。
-        fetchOnlineCoversForImportedSongs(freshSongs);
     }
     return { fresh: freshSongs, resolved: resolvedSongs };
+};
+
+// Flush document covers with each small batch instead of retaining every cover until the entire library finishes.
+const buildAndStoreImportedTracks = async (tracks: NativeAudioTrack[]): Promise<ImportedTracksResult> => {
+    const index: ImportedSongIndex = { byRef: new Map(), byContent: new Map() };
+    const existingSongs = tracks.length > 0 ? await getLocalSongs() : [];
+    for (const song of existingSongs) {
+        if (song.nativeAudioRef && !index.byRef.has(song.nativeAudioRef)) index.byRef.set(song.nativeAudioRef, song);
+        const key = song.nativeAudioRef?.startsWith('document-') ? null : pickedContentKey(song.fileName, song.fileSize);
+        if (key && !index.byContent.has(key)) index.byContent.set(key, song);
+    }
+    const result: ImportedTracksResult = { fresh: [], resolved: [] };
+    const batchSize = tracks.some(track => track.id.startsWith('document-')) ? 25 : Math.max(1, tracks.length);
+    for (let offset = 0; offset < tracks.length; offset += batchSize) {
+        const batch = await buildAndStoreImportedBatch(tracks.slice(offset, offset + batchSize), index);
+        result.fresh.push(...batch.fresh);
+        result.resolved.push(...batch.resolved);
+    }
+    // Keep the original online-cover fallback after import; embedded covers are already persisted.
+    if (result.fresh.length > 0) fetchOnlineCoversForImportedSongs(result.fresh);
+    return result;
 };
 
 export const pickAndroidLocalMusic = async (): Promise<LocalSong[]> => {
